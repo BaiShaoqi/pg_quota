@@ -13,15 +13,15 @@
 
 #include "access/htup_details.h"
 #include "catalog/pg_class.h"
-#include "executor/executor.h"
+#include "storage/smgr.h"
 #include "utils/syscache.h"
 
 #include "pg_quota.h"
 
-static bool quota_check_ExecCheckRTPerms(List *rangeTable, bool ereport_on_violation);
+static void quota_check_SmgrExtend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, char *buffer, bool skipFsync);
 
-static ExecutorCheckPerms_hook_type prev_ExecutorCheckPerms_hook;
-static bool ExecutorCheckPerms_hook_installed = false;
+static SmgrExtend_hook_type prev_SmgrExtend_hook;
+static bool SmgrExtend_hook_installed = false;
 
 /*
  * Initialize enforcement, by installing the executor permission hook.
@@ -29,12 +29,12 @@ static bool ExecutorCheckPerms_hook_installed = false;
 void
 init_quota_enforcement(void)
 {
-	if (!ExecutorCheckPerms_hook_installed)
+	if (!SmgrExtend_hook_installed)
 	{
-		prev_ExecutorCheckPerms_hook = ExecutorCheckPerms_hook;
-		ExecutorCheckPerms_hook = quota_check_ExecCheckRTPerms;
+		prev_SmgrExtend_hook = SmgrExtend_hook;
+		SmgrExtend_hook = quota_check_SmgrExtend;
 
-		elog(DEBUG1, "disk quota permissions hook installed");
+		elog(DEBUG1, "disk quota SmgrExtend hook installed");
 	}
 }
 
@@ -64,49 +64,27 @@ get_rel_owner(Oid relid)
  * Permission check hook function. Throws an error if you try to INSERT
  * (or COPY) into a table, and the quota has been exceeded.
  */
-static bool
-quota_check_ExecCheckRTPerms(List *rangeTable, bool ereport_on_violation)
+static void
+quota_check_SmgrExtend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, char *buffer, bool skipFsync)
 {
-	ListCell   *l;
+	Oid owner;
+		
+	owner = get_rel_owner(reln->smgr_rnode.node.relNode);
+	if (owner == InvalidOid)
+		return; /* no owner, huh? */
 
-	foreach(l, rangeTable)
+	if (!CheckQuota(owner))
 	{
-		RangeTblEntry *rte = (RangeTblEntry *) lfirst(l);
-		Oid			owner;
-
-		/* see ExecCheckRTEPerms() */
-		if (rte->rtekind != RTE_RELATION)
-			continue;
-
 		/*
-		 * Only check quota on inserts. UPDATEs may well increase
-		 * space usage too, but we ignore that for now.
+		 * The owner is out of quota. Report error.
+		 *
+		 * We
 		 */
-		if ((rte->requiredPerms & ACL_INSERT) == 0)
-			continue;
-
-		/*
-		 * Perform the check as the relation's owner, rather than the current
-		 * user.
-		 */
-		owner = get_rel_owner(rte->relid);
-		if (owner == InvalidOid)
-			return true; /* no owner, huh? */
-
-		if (!CheckQuota(owner))
-		{
-			/*
-			 * The owner is out of quota. Report error.
-			 *
-			 * We
-			 */
-			if (ereport_on_violation)
-				ereport(ERROR,
-						(errcode(ERRCODE_DISK_FULL),
-						 errmsg("user's disk space quota exceeded")));
-			return false;
-		}
+		ereport(ERROR,
+			(errcode_for_file_access(),
+			errmsg("could not extend file"),
+			errhint("Check free disk space.")));
 	}
 
-	return true;
+	return;
 }
