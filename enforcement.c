@@ -81,9 +81,8 @@ quota_check_SmgrExtend(SMgrRelation reln, ForkNumber forknum, BlockNumber blockn
 		 * We
 		 */
 		ereport(ERROR,
-			(errcode_for_file_access(),
-			errmsg("could not extend file"),
-			errhint("Check free disk space.")));
+				(errcode(ERRCODE_DISK_FULL),
+				errmsg("user's disk space quota exceeded")));
 	}
 
 	return;
