@@ -86,10 +86,10 @@ pg_quota_sighup(SIGNAL_ARGS)
 }
 
 /*
- * Load quotas from configuration table.
+ * Load quotas from configuration table and refresh relation size.
  */
 static void
-load_quotas(void)
+load_quotas_refresh_fs_model(void)
 {
 	int			ret;
 	TupleDesc	tupdesc;
@@ -107,76 +107,46 @@ load_quotas(void)
 		return;
 	}
 
-	ret = SPI_execute("select roleid, quota int8 from quota.config", true, 0);
+	ret = SPI_execute("select relationid, pg_total_relation_size(relationid) int8, quota int8 from quota.config", true, 0);
 	if (ret != SPI_OK_SELECT)
 		elog(FATAL, "SPI_execute failed: error code %d", ret);
 
 	tupdesc = SPI_tuptable->tupdesc;
-	if (tupdesc->natts != 2 ||
+	if (tupdesc->natts != 3 ||
 		TupleDescAttr(tupdesc, 0)->atttypid != OIDOID ||
-		TupleDescAttr(tupdesc, 1)->atttypid != INT8OID)
-		elog(ERROR, "query must yield two columns, oid and int8");
+		TupleDescAttr(tupdesc, 1)->atttypid != INT8OID ||
+		TupleDescAttr(tupdesc, 2)->atttypid != INT8OID)
+		elog(ERROR, "query must yield three columns, oid, int8 and int8");
 
 	for (i = 0; i < SPI_processed; i++)
 	{
 		HeapTuple	tup = SPI_tuptable->vals[i];
 		Datum		dat;
-		Oid			roleid;
+		Oid			relationid;
+		int64		totalsize;
 		int64		quota;
 		bool		isnull;
 
 		dat = SPI_getbinval(tup, tupdesc, 1, &isnull);
 		if (isnull)
 			continue;
-		roleid = DatumGetObjectId(dat);
+		relationid = DatumGetObjectId(dat);
 
 		dat = SPI_getbinval(tup, tupdesc, 2, &isnull);
+		if (isnull)
+			continue;
+		totalsize = DatumGetInt64(dat);
+
+		dat = SPI_getbinval(tup, tupdesc, 3, &isnull);
 		if (isnull)
 			continue;
 		quota = DatumGetInt64(dat);
 
 		/* Update the model with this */
-		UpdateQuota(roleid, quota);
+		UpdateQuotaRefreshRelationSize(relationid, quota, totalsize);
 	}
 
 	heap_close(rel, NoLock);
-}
-
-/*
- * get_relfilenode_owner
- *
- *		Returns the owner OID associated with a given relation.
- */
-Oid
-get_relfilenode_owner(RelFileNode *rnode)
-{
-	Oid			relid;
-	HeapTuple	tp;
-
-	Assert(rnode->dbNode == MyDatabaseId);
-	relid = RelidByRelfilenode(rnode->spcNode, rnode->relNode);
-	if (!OidIsValid(relid))
-	{
-		elog(DEBUG1, "could not find pg_class entry for relation %u/%u/%u",
-			 rnode->dbNode, rnode->spcNode, rnode->relNode);
-		return InvalidOid;
-	}
-
-	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
-	if (HeapTupleIsValid(tp))
-	{
-		Form_pg_class reltup = (Form_pg_class) GETSTRUCT(tp);
-		Oid			result;
-
-		result = reltup->relowner;
-		ReleaseSysCache(tp);
-		return result;
-	}
-	else
-	{
-		elog(DEBUG1, "could not find owner for relation %u", relid);
-		return InvalidOid;
-	}
 }
 
 /*
@@ -242,12 +212,6 @@ pg_quota_worker_main(Datum main_arg)
 		}
 
 		/*
-		 * Rescan the data directory.
-		 */
-		pgstat_report_activity(STATE_RUNNING, "scanning datadir");
-		refresh_fs_model();
-
-		/*
 		 * Start a transaction on which we can run queries.  Note that each
 		 * StartTransactionCommand() call should be preceded by a
 		 * SetCurrentStatementStartTimestamp() call, which sets both the time
@@ -268,16 +232,9 @@ pg_quota_worker_main(Datum main_arg)
 		SPI_connect();
 		PushActiveSnapshot(GetTransactionSnapshot());
 
-		pgstat_report_activity(STATE_RUNNING, "scanning pg_class");
 
-		/*
-		 * If there are any relfilenodes for which we don't know the owner, look
-		 * them up.
-		 */
-		UpdateOrphans();
-
-		pgstat_report_activity(STATE_RUNNING, "loading quota configuration");
-		load_quotas();
+		pgstat_report_activity(STATE_RUNNING, "loading quota configuration and refresh relation size");
+		load_quotas_refresh_fs_model();
 
 		/*
 		 * And finish our transaction.
